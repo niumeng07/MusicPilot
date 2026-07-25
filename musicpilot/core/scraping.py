@@ -502,13 +502,7 @@ class LocalMusicScraper:
                         exc,
                     )
                     continue
-                if action == "existing":
-                    logger.info(
-                        "Album cover skipped because target exists: source=%s, target=%s",
-                        source_cover,
-                        output_path,
-                    )
-                elif fallback_error is not None:
+                if fallback_error is not None:
                     logger.warning(
                         "Album cover hardlink failed and copied instead: source=%s, "
                         "target=%s, error=%s",
@@ -973,7 +967,13 @@ class LocalMusicScraper:
                         ),
                     )
                 missing_required = _missing_metadata_fields(metadata, config.required_metadata)
-                if missing_required:
+                metadata_gain = _filled_metadata_fields(
+                    source_metadata,
+                    metadata,
+                    missing_before,
+                )
+                # 已从网络正确拿到可写入结果时，先写入文件，不再因仍缺必需字段而失败。
+                if missing_required and not metadata_gain:
                     error_message = await _candidate_failure_message(
                         verification_reference,
                         config.required_metadata,
@@ -1011,11 +1011,14 @@ class LocalMusicScraper:
                         0,
                         0,
                     )
-                metadata_gain = _filled_metadata_fields(
-                    source_metadata,
-                    metadata,
-                    missing_before,
-                )
+                if missing_required and metadata_gain:
+                    logger.info(
+                        "Scraping partial metadata write: source=%s, "
+                        "metadata_gain=%s, missing_required=%s",
+                        source_file,
+                        metadata_gain,
+                        missing_required,
+                    )
         elif needs_scrape:
             candidates = cached_candidates
             looked_up = await _select_metadata_candidate(
@@ -1096,6 +1099,11 @@ class LocalMusicScraper:
                     looked_up,
                 )
             missing_required = _missing_metadata_fields(metadata, config.required_metadata)
+            metadata_gain = _filled_metadata_fields(
+                source_metadata,
+                metadata,
+                missing_before,
+            )
             version_error = (
                 await _version_control_failure_text(
                     candidate_reference,
@@ -1107,70 +1115,26 @@ class LocalMusicScraper:
                 if looked_up is None and config.track_version_control
                 else None
             )
-            if looked_up is None:
-                if not missing_required and version_error is None:
-                    metadata_gain = _filled_metadata_fields(
-                        source_metadata,
-                        metadata,
-                        missing_before,
+            # 已正确拿到网络结果时先写入；仅在无任何可写入增益时才因缺字段失败。
+            if looked_up is None and (missing_required or version_error is not None):
+                error_message = version_error
+                if error_message is None:
+                    error_message = await _candidate_failure_message(
+                        candidate_reference,
+                        config.required_metadata,
+                        candidates,
+                        artist_service=self.artist_service,
+                        track_version_control=config.track_version_control,
+                        reference_file=source_file,
+                        trigger_fields=missing_before,
+                        require_trigger_gain=True,
                     )
-                else:
-                    error_message = version_error
-                    if error_message is None:
-                        error_message = await _candidate_failure_message(
-                            candidate_reference,
-                            config.required_metadata,
-                            candidates,
-                            artist_service=self.artist_service,
-                            track_version_control=config.track_version_control,
-                            reference_file=source_file,
-                            trigger_fields=missing_before,
-                            require_trigger_gain=True,
-                        )
-                    logger.info(
-                        "Scraping file result: source=%s, status=failed, stage=%s, "
-                        "metadata=%s, error=%s",
-                        source_file,
-                        candidate_stage,
-                        _metadata_log_text(source_metadata),
-                        error_message,
-                    )
-                    return (
-                        ScrapingFileResult(
-                            source_path=source_file,
-                            library_path=None,
-                            metadata=source_metadata,
-                            status="failed",
-                            operation_type=config.mode,
-                            operation_reason=build_operation_reason(),
-                            error_message=error_message,
-                            stage=candidate_stage,
-                            needs_metadata_update=needs_scrape,
-                            candidate_count=candidate_count,
-                        ),
-                        0,
-                        0,
-                        0,
-                    )
-            elif missing_required:
-                error_message = await _candidate_failure_message(
-                    candidate_reference,
-                    config.required_metadata,
-                    candidates,
-                    artist_service=self.artist_service,
-                    track_version_control=config.track_version_control,
-                    reference_file=source_file,
-                    trigger_fields=missing_before,
-                    require_trigger_gain=True,
-                )
                 logger.info(
                     "Scraping file result: source=%s, status=failed, stage=%s, "
-                    "metadata=%s, selected=%s, missing_required=%s, error=%s",
+                    "metadata=%s, error=%s",
                     source_file,
                     candidate_stage,
                     _metadata_log_text(source_metadata),
-                    _metadata_log_text(looked_up),
-                    missing_required,
                     error_message,
                 )
                 return (
@@ -1190,11 +1154,14 @@ class LocalMusicScraper:
                     0,
                     0,
                 )
-            else:
-                metadata_gain = _filled_metadata_fields(
-                    source_metadata,
-                    metadata,
-                    missing_before,
+            if looked_up is not None and missing_required and metadata_gain:
+                logger.info(
+                    "Scraping partial metadata write: source=%s, selected=%s, "
+                    "metadata_gain=%s, missing_required=%s",
+                    source_file,
+                    _metadata_log_text(looked_up),
+                    metadata_gain,
+                    missing_required,
                 )
         writes_tags = should_write_tags or bool(metadata_gain)
         if tag_writer is None and writes_tags:
@@ -1279,7 +1246,9 @@ class LocalMusicScraper:
         overwrite_duplicate = False
         current_size = await asyncio.to_thread(_file_size, source_file)
         if duplicate is not None:
-            if config.duplicate_handling == "ignore":
+            # 已从网络拿到可写入元数据时，不再因库内重复文件跳过写入。
+            # 仅在无标签可写时仍按重复策略跳过转移。
+            if config.duplicate_handling == "ignore" and not writes_tags:
                 error_message = _duplicate_skip_message(
                     metadata,
                     duplicate,
@@ -1314,46 +1283,63 @@ class LocalMusicScraper:
                 )
             if config.duplicate_handling == "keep_largest":
                 if duplicate.size is None or current_size <= duplicate.size:
-                    reason = (
-                        "音乐库文件大小未知，无法确认当前文件更大"
-                        if duplicate.size is None
-                        else "当前文件不大于音乐库文件，保留最大文件"
-                    )
-                    error_message = _duplicate_skip_message(
-                        metadata,
-                        duplicate,
-                        current_size,
-                        config=config,
-                        reason=reason,
-                        matched_metadata=duplicate_match.metadata,
-                    )
+                    if not writes_tags:
+                        reason = (
+                            "音乐库文件大小未知，无法确认当前文件更大"
+                            if duplicate.size is None
+                            else "当前文件不大于音乐库文件，保留最大文件"
+                        )
+                        error_message = _duplicate_skip_message(
+                            metadata,
+                            duplicate,
+                            current_size,
+                            config=config,
+                            reason=reason,
+                            matched_metadata=duplicate_match.metadata,
+                        )
+                        logger.info(
+                            "Scraping file result: source=%s, status=skipped, "
+                            "stage=skip_smaller_duplicate, metadata=%s, error=%s",
+                            source_file,
+                            _metadata_log_text(metadata),
+                            error_message,
+                        )
+                        return (
+                            ScrapingFileResult(
+                                source_path=source_file,
+                                library_path=None,
+                                metadata=metadata,
+                                status="skipped",
+                                operation_type=config.mode,
+                                operation_reason=build_operation_reason(),
+                                error_message=error_message,
+                                stage="skip_smaller_duplicate",
+                                needs_metadata_update=needs_scrape,
+                                candidate_count=candidate_count,
+                            ),
+                            0,
+                            0,
+                            0,
+                        )
                     logger.info(
-                        "Scraping file result: source=%s, status=skipped, "
-                        "stage=skip_smaller_duplicate, metadata=%s, error=%s",
+                        "Scraping continue despite smaller duplicate: source=%s, "
+                        "metadata_gain=%s, duplicate=%s",
                         source_file,
-                        _metadata_log_text(metadata),
-                        error_message,
+                        metadata_gain,
+                        duplicate.path,
                     )
-                    return (
-                        ScrapingFileResult(
-                            source_path=source_file,
-                            library_path=None,
-                            metadata=metadata,
-                            status="skipped",
-                            operation_type=config.mode,
-                            operation_reason=build_operation_reason(),
-                            error_message=error_message,
-                            stage="skip_smaller_duplicate",
-                            needs_metadata_update=needs_scrape,
-                            candidate_count=candidate_count,
-                        ),
-                        0,
-                        0,
-                        0,
-                    )
+                else:
+                    overwrite_duplicate = True
+            elif config.duplicate_handling == "overwrite":
                 overwrite_duplicate = True
-            elif config.duplicate_handling in {"overwrite", "keep_largest"}:
-                overwrite_duplicate = True
+            elif writes_tags and config.duplicate_handling == "ignore":
+                logger.info(
+                    "Scraping write despite library duplicate: source=%s, "
+                    "metadata_gain=%s, duplicate=%s",
+                    source_file,
+                    metadata_gain,
+                    duplicate.path,
+                )
 
         overwritten_existing_target = False
         operation_type = config.mode
@@ -2435,25 +2421,24 @@ def _transfer_album_cover(
     target_dir: Path,
     config: ScrapingConfig,
 ) -> tuple[str, Path, OSError | None]:
-    existing = _existing_album_cover(target_dir)
-    if existing is not None:
-        return "existing", existing, None
-
     target_dir.mkdir(parents=True, exist_ok=True)
     target_path = target_dir / f"Cover{source_path.suffix}"
+    existing = _existing_album_cover(target_dir)
+    if existing is not None and existing != target_path:
+        # 目标目录已有其他扩展名的封面时，先移除再写入新结果。
+        existing.unlink(missing_ok=True)
+
     if config.mode == "mapped":
         try:
+            if target_path.exists():
+                target_path.unlink()
             os.link(source_path, target_path)
             return "hardlink", target_path, None
-        except FileExistsError:
-            return "existing", target_path, None
         except OSError as exc:
-            if not _copy_file_without_overwrite(source_path, target_path):
-                return "existing", target_path, None
+            _copy_file_overwrite(source_path, target_path)
             return "copy", target_path, exc
 
-    if not _copy_file_without_overwrite(source_path, target_path):
-        return "existing", target_path, None
+    _copy_file_overwrite(source_path, target_path)
     if config.mode == "source":
         source_path.unlink()
         _remove_empty_parents(source_path.parent, config)
@@ -2461,20 +2446,11 @@ def _transfer_album_cover(
     return "copy", target_path, None
 
 
-def _copy_file_without_overwrite(source_path: Path, target_path: Path) -> bool:
-    target_created = False
-    try:
-        with source_path.open("rb") as source, target_path.open("xb") as target:
-            target_created = True
-            shutil.copyfileobj(source, target)
-        shutil.copystat(source_path, target_path)
-    except FileExistsError:
-        return False
-    except Exception:
-        if target_created:
-            target_path.unlink(missing_ok=True)
-        raise
-    return True
+def _copy_file_overwrite(source_path: Path, target_path: Path) -> None:
+    target_path.parent.mkdir(parents=True, exist_ok=True)
+    with source_path.open("rb") as source, target_path.open("wb") as target:
+        shutil.copyfileobj(source, target)
+    shutil.copystat(source_path, target_path)
 
 
 def _copy_to_mapping(
@@ -3185,8 +3161,9 @@ async def _select_metadata_candidate(
     """Select the best metadata candidate using scoring.
 
     Scores all candidates by title/artist/album match against the existing
-    metadata. Returns the highest-scoring candidate that fills required
-    fields, if its score meets the minimum threshold.
+    metadata. When ``require_trigger_gain`` is set, any candidate that
+    provides missing trigger fields may be selected; otherwise the candidate
+    must fill all required fields. The score must meet the minimum threshold.
     """
     ranked = await _rank_metadata_candidates(
         existing,
@@ -3215,10 +3192,12 @@ async def _rank_metadata_candidates(
 ) -> tuple[TrackMetadata, ...]:
     scored: list[tuple[_CandidateScore, int, TrackMetadata]] = []
     for candidate in candidates:
-        if not _candidate_fills_required(existing, candidate, required):
-            continue
         trigger_gain = _candidate_trigger_gain(candidate, trigger_fields)
-        if require_trigger_gain and not trigger_gain:
+        if require_trigger_gain:
+            # 网络结果只需补上触发字段中的任意项即可写入，不再要求一次补齐全部必需字段。
+            if not trigger_gain:
+                continue
+        elif not _candidate_fills_required(existing, candidate, required):
             continue
         score = await _candidate_match_score(
             existing,
@@ -3515,7 +3494,7 @@ async def _candidate_diagnostics_text(
         trigger_gain = _candidate_trigger_gain(candidate, trigger_fields)
         album_mismatch = _candidate_has_conflicting_album(metadata, candidate)
         reasons: list[str] = []
-        if missing:
+        if missing and not require_trigger_gain:
             reasons.append(f"missing={','.join(missing)}")
         if album_mismatch:
             reasons.append("album_mismatch")
