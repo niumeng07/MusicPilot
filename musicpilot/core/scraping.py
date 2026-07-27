@@ -967,7 +967,7 @@ class LocalMusicScraper:
                         ),
                     )
                 missing_required = _missing_metadata_fields(metadata, config.required_metadata)
-                metadata_gain = _filled_metadata_fields(
+                metadata_gain = _metadata_write_gain(
                     source_metadata,
                     metadata,
                     missing_before,
@@ -1099,7 +1099,7 @@ class LocalMusicScraper:
                     looked_up,
                 )
             missing_required = _missing_metadata_fields(metadata, config.required_metadata)
-            metadata_gain = _filled_metadata_fields(
+            metadata_gain = _metadata_write_gain(
                 source_metadata,
                 metadata,
                 missing_before,
@@ -1163,6 +1163,19 @@ class LocalMusicScraper:
                     metadata_gain,
                     missing_required,
                 )
+        prepared_metadata = metadata
+        if tag_writer is not None and (
+            should_write_tags or needs_scrape or forced_metadata is not None
+        ):
+            prepared_metadata = await _normalize_metadata_for_tag_write(
+                metadata,
+                self.artist_service,
+            )
+        metadata_gain = _metadata_write_gain(
+            source_metadata,
+            prepared_metadata,
+            missing_before,
+        )
         writes_tags = should_write_tags or bool(metadata_gain)
         if tag_writer is None and writes_tags:
             logger.info(
@@ -1191,10 +1204,7 @@ class LocalMusicScraper:
             )
 
         if writes_tags:
-            metadata = await _normalize_metadata_for_tag_write(
-                metadata,
-                self.artist_service,
-            )
+            metadata = prepared_metadata
         elif self.artist_service is not None:
             canonical = await self.artist_service.get_canonical_name(metadata.artist)
             if canonical is not None:
@@ -1246,100 +1256,22 @@ class LocalMusicScraper:
         overwrite_duplicate = False
         current_size = await asyncio.to_thread(_file_size, source_file)
         if duplicate is not None:
-            # 已从网络拿到可写入元数据时，不再因库内重复文件跳过写入。
-            # 仅在无标签可写时仍按重复策略跳过转移。
-            if config.duplicate_handling == "ignore" and not writes_tags:
-                error_message = _duplicate_skip_message(
+            logger.info(
+                "Scraping library duplicate detected: source=%s, %s",
+                source_file,
+                _duplicate_detected_message(
                     metadata,
                     duplicate,
                     current_size,
                     config=config,
-                    reason="音乐库已存在，重复文件处理为不处理",
                     matched_metadata=duplicate_match.metadata,
-                )
-                logger.info(
-                    "Scraping file result: source=%s, status=skipped, stage=skip_duplicate, "
-                    "metadata=%s, error=%s",
-                    source_file,
-                    _metadata_log_text(metadata),
-                    error_message,
-                )
-                return (
-                    ScrapingFileResult(
-                        source_path=source_file,
-                        library_path=None,
-                        metadata=metadata,
-                        status="skipped",
-                        operation_type=config.mode,
-                        operation_reason=build_operation_reason(),
-                        error_message=error_message,
-                        stage="skip_duplicate",
-                        needs_metadata_update=needs_scrape,
-                        candidate_count=candidate_count,
-                    ),
-                    0,
-                    0,
-                    0,
-                )
-            if config.duplicate_handling == "keep_largest":
-                if duplicate.size is None or current_size <= duplicate.size:
-                    if not writes_tags:
-                        reason = (
-                            "音乐库文件大小未知，无法确认当前文件更大"
-                            if duplicate.size is None
-                            else "当前文件不大于音乐库文件，保留最大文件"
-                        )
-                        error_message = _duplicate_skip_message(
-                            metadata,
-                            duplicate,
-                            current_size,
-                            config=config,
-                            reason=reason,
-                            matched_metadata=duplicate_match.metadata,
-                        )
-                        logger.info(
-                            "Scraping file result: source=%s, status=skipped, "
-                            "stage=skip_smaller_duplicate, metadata=%s, error=%s",
-                            source_file,
-                            _metadata_log_text(metadata),
-                            error_message,
-                        )
-                        return (
-                            ScrapingFileResult(
-                                source_path=source_file,
-                                library_path=None,
-                                metadata=metadata,
-                                status="skipped",
-                                operation_type=config.mode,
-                                operation_reason=build_operation_reason(),
-                                error_message=error_message,
-                                stage="skip_smaller_duplicate",
-                                needs_metadata_update=needs_scrape,
-                                candidate_count=candidate_count,
-                            ),
-                            0,
-                            0,
-                            0,
-                        )
-                    logger.info(
-                        "Scraping continue despite smaller duplicate: source=%s, "
-                        "metadata_gain=%s, duplicate=%s",
-                        source_file,
-                        metadata_gain,
-                        duplicate.path,
-                    )
-                else:
-                    overwrite_duplicate = True
-            elif config.duplicate_handling == "overwrite":
+                ),
+            )
+            if config.duplicate_handling == "overwrite":
                 overwrite_duplicate = True
-            elif writes_tags and config.duplicate_handling == "ignore":
-                logger.info(
-                    "Scraping write despite library duplicate: source=%s, "
-                    "metadata_gain=%s, duplicate=%s",
-                    source_file,
-                    metadata_gain,
-                    duplicate.path,
-                )
+            elif config.duplicate_handling == "keep_largest":
+                if duplicate.size is not None and current_size > duplicate.size:
+                    overwrite_duplicate = True
 
         overwritten_existing_target = False
         operation_type = config.mode
@@ -2819,6 +2751,27 @@ def _duplicate_skip_message(
     )
 
 
+def _duplicate_detected_message(
+    metadata: TrackMetadata,
+    track: LibraryTrackSnapshot,
+    current_size: int,
+    *,
+    config: ScrapingConfig,
+    matched_metadata: TrackMetadata | None = None,
+) -> str:
+    existing_path = _library_track_path(track, config)
+    path_text = f"，曲库路径={existing_path}" if existing_path is not None else ""
+    match_text = _duplicate_match_metadata_text(metadata, matched_metadata)
+    return (
+        f"当前文件与曲库歌曲重复。"
+        f"识别={metadata.title}/{metadata.artist or '-'}，"
+        f"{match_text}"
+        f"当前大小={_format_size(current_size)}，"
+        f"曲库大小={_format_size(track.size)}"
+        f"{path_text}"
+    )
+
+
 def _duplicate_overwrite_message(
     metadata: TrackMetadata,
     track: LibraryTrackSnapshot,
@@ -3889,8 +3842,14 @@ def _merge_missing_metadata(
     artist = existing.artist
     album = existing.album
     if not preserve_artist_album:
-        artist = existing.artist or scraped.artist
+        if _should_apply_scraped_artist(existing, scraped):
+            artist = scraped.artist
+        else:
+            artist = existing.artist or scraped.artist
         album = existing.album or scraped.album
+    lyrics = existing.lyrics
+    if _should_apply_scraped_lyrics(existing, scraped):
+        lyrics = scraped.lyrics
     cover_url = existing.cover_url
     if not existing.has_cover:
         cover_url = cover_url or scraped.cover_url
@@ -3901,11 +3860,37 @@ def _merge_missing_metadata(
         album_artist=existing.album_artist or scraped.album_artist,
         year=existing.year or scraped.year,
         track_number=existing.track_number or scraped.track_number,
-        lyrics=existing.lyrics or scraped.lyrics,
+        lyrics=lyrics,
         cover_url=cover_url,
         has_cover=existing.has_cover,
         extra={**existing.extra, **scraped.extra},
     )
+
+
+def _should_apply_scraped_artist(
+    existing: TrackMetadata,
+    scraped: TrackMetadata,
+) -> bool:
+    if not _metadata_has_value(scraped, "artist"):
+        return False
+    if not _metadata_has_value(existing, "artist"):
+        return True
+    return _normalize_match_text(existing.artist) != _normalize_match_text(scraped.artist)
+
+
+def _should_apply_scraped_lyrics(
+    existing: TrackMetadata,
+    scraped: TrackMetadata,
+) -> bool:
+    if not _metadata_has_value(scraped, "lyrics"):
+        return False
+    if not _metadata_has_value(existing, "lyrics"):
+        return True
+    return _lyrics_text(existing.lyrics) != _lyrics_text(scraped.lyrics)
+
+
+def _lyrics_text(value: str | None) -> str:
+    return _to_simplified(value or "").strip()
 
 
 def _metadata_fields_union(
@@ -3936,6 +3921,32 @@ def _filled_metadata_fields(
         for field in fields
         if not _metadata_has_value(before, field) and _metadata_has_value(after, field)
     )
+
+
+def _metadata_write_gain(
+    before: TrackMetadata,
+    after: TrackMetadata,
+    missing_before: tuple[RequiredMetadata, ...],
+) -> tuple[RequiredMetadata, ...]:
+    gain: list[RequiredMetadata] = []
+    seen: set[RequiredMetadata] = set()
+    for field in _filled_metadata_fields(before, after, missing_before):
+        gain.append(field)
+        seen.add(field)
+    for field in ("artist", "lyrics"):
+        if field in seen:
+            continue
+        if field == "artist":
+            changed = (
+                _metadata_has_value(after, "artist")
+                and _normalize_match_text(before.artist) != _normalize_match_text(after.artist)
+            )
+        else:
+            changed = _should_apply_scraped_lyrics(before, after)
+        if changed:
+            gain.append(field)
+            seen.add(field)
+    return tuple(gain)
 
 
 def _metadata_has_value(metadata: TrackMetadata, field: RequiredMetadata) -> bool:
